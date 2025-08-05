@@ -6,6 +6,8 @@ use std::{
     env,
     fs,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+    time::{Instant, Duration},
 };
 
 #[derive(Debug, Clone)]
@@ -29,6 +31,7 @@ struct FileExplorer {
     drives: Vec<PathBuf>,
     drive_buttons: Vec<button::State>,
     show_drives: bool,
+    last_click_time: Option<Instant>,  // Track the last click time
 }
 
 impl FileExplorer {
@@ -77,6 +80,26 @@ impl FileExplorer {
             vec![PathBuf::from("/")]
         }
     }
+
+    fn open_file(&self, file_path: &Path) {
+        if cfg!(windows) {
+            if let Some(valid_path) = file_path.to_str() {
+                if let Err(err) = ProcessCommand::new("cmd")
+                    .args(&["/C", "start", valid_path])
+                    .spawn()
+                {
+                    eprintln!("Failed to open file (Windows): {}", err);
+                }
+            }
+        } else {
+            if let Err(err) = ProcessCommand::new("xdg-open")
+                .arg(file_path)  // Use to_string_lossy for safe conversion
+                .spawn()
+            {
+                eprintln!("Failed to open file (Linux/macOS): {}", err);
+            }
+        }
+    }
 }
 
 impl Application for FileExplorer {
@@ -93,6 +116,7 @@ impl Application for FileExplorer {
             drives,
             drive_buttons,
             show_drives: false,
+            last_click_time: None,  // Initialize with no click
             ..FileExplorer::default()
         };
         explorer.list_files();
@@ -110,6 +134,22 @@ impl Application for FileExplorer {
     ) -> Command<Message> {
         match message {
             Message::FileClicked(path) => {
+                let now = Instant::now();
+                
+                // If we had a previous click and it's within 500ms, consider it a double-click
+                if let Some(last_click) = self.last_click_time {
+                    if now.duration_since(last_click) < Duration::from_millis(500) {
+                        // Double-click detected, open the file
+                        if path.is_file() {
+                            self.open_file(&path);
+                        }
+                    }
+                }
+
+                // Update the last click time
+                self.last_click_time = Some(now);
+
+                // Handle file/directory navigation
                 let target_path = if path == PathBuf::from("..") {
                     self.path.parent().map_or(self.path.clone(), |p| p.to_path_buf())
                 } else if path.is_relative() {
@@ -117,13 +157,14 @@ impl Application for FileExplorer {
                 } else {
                     path
                 };
+
                 if target_path.is_dir() {
                     self.path = target_path;
                     self.show_drives = false;
                     self.list_files()
                 } else {
                     println!("File selected: {:?}", target_path);
-                    Command::none()
+                    Command::none()  // No further action if it’s just a click (not a double-click)
                 }
             }
             Message::Refresh => self.list_files(),
@@ -172,7 +213,7 @@ impl Application for FileExplorer {
         if cfg!(windows) {
             top_row = top_row.push(
                 Button::new(&mut self.drive_button, Text::new("Drives"))
-                    .on_press(Message::GoUp)
+                    .on_press(Message::DriveSelected(PathBuf::from("C:\\")))  // or any default drive
                     .padding(5),
             );
         }
@@ -207,59 +248,59 @@ impl Application for FileExplorer {
                 drives_row = drives_row.push(button);
             }
             
-            column = column.push(
-                Scrollable::new(&mut self.drives_scroll)
-                    .push(drives_row)
-                    .height(Length::Units(40))
-                    .width(Length::Fill)
-            );
-            
-            column = column.push(Space::with_height(Length::Units(10)));
+            column = column.push(                        
+                        Scrollable::new(&mut self.drives_scroll)
+                            .push(drives_row)
+                            .height(Length::Units(40))
+                            .width(Length::Fill)
+                    );
+                    
+                    column = column.push(Space::with_height(Length::Units(10)));
+                }
+
+                // Files list with proper spacing
+                let mut files_column = Column::new().spacing(5);
+                self.file_buttons
+                    .resize_with(self.files.len(), button::State::new);
+
+                for (file, btn_state) in self.files.iter().zip(self.file_buttons.iter_mut()) {
+                    let display_name = if file == &PathBuf::from("..") {
+                        ".. (parent)".to_string()
+                    } else {
+                        file.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("Unknown")
+                            .to_string()
+                    };
+
+                    // 2. Show files/directories with icons
+                    let prefix = if file.is_dir() { 
+                        Text::new("📁 ")  // Folder icon
+                    } else {
+                        Text::new("📄 ")  // File icon
+                    };
+
+                    let full_text = Row::new()
+                        .push(prefix)
+                        .push(Text::new(display_name));
+
+                    // 3. Navigate into directories by clicking
+                    let button = Button::new(btn_state, full_text)
+                        .on_press(Message::FileClicked(file.clone()))
+                        .padding(5);
+
+                    files_column = files_column.push(button);
+                }
+
+                column = column.push(
+                    Scrollable::new(&mut self.scroll)
+                        .push(files_column)
+                        .height(Length::Fill)
+                );
+
+                column.into()
+            }
         }
-
-        // Files list with proper spacing
-        let mut files_column = Column::new().spacing(5);
-        self.file_buttons
-            .resize_with(self.files.len(), button::State::new);
-
-        for (file, btn_state) in self.files.iter().zip(self.file_buttons.iter_mut()) {
-            let display_name = if file == &PathBuf::from("..") {
-                ".. (parent)".to_string()
-            } else {
-                file.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Unknown")
-                    .to_string()
-            };
-
-            // 2. Show files/directories with icons
-            let prefix = if file.is_dir() { 
-                Text::new("📁 ")  // Folder icon
-            } else {
-                Text::new("📄 ")  // File icon
-            };
-
-            let full_text = Row::new()
-                .push(prefix)
-                .push(Text::new(display_name));
-
-            // 3. Navigate into directories by clicking
-            let button = Button::new(btn_state, full_text)
-                .on_press(Message::FileClicked(file.clone()))
-                .padding(5);
-
-            files_column = files_column.push(button);
-        }
-
-        // Wrap in scrollable
-        let scrollable_list = Scrollable::new(&mut self.scroll)
-            .push(files_column)
-            .height(Length::Fill);
-
-        column = column.push(scrollable_list);
-        column.into()
-    }
-}
 
 fn main() -> iced::Result {
     FileExplorer::run(Settings::default())
